@@ -313,3 +313,236 @@ func TestEncode_UnexporterStruct(t *testing.T) {
 	enc.Encode(&unexportesStruct{value: 5})
 	assert.Equal(t, expectData, buf.Bytes())
 }
+
+// Test data setup helpers
+func createSampleForest(numNodes int) *Forest {
+	nodes := make([]*Node, numNodes)
+
+	// Create a repeating pattern of different node types
+	for i := 0; i < numNodes; i++ {
+		switch i % 3 {
+		case 0:
+			nodes[i] = &Node{
+				BaseVariant: BaseVariant{
+					TypeID: TypeIDFromUint32(0, binary.LittleEndian),
+					Impl: &NodeLeft{
+						Key:         uint32(i),
+						Description: "test description",
+					},
+				},
+			}
+		case 1:
+			nodes[i] = &Node{
+				BaseVariant: BaseVariant{
+					TypeID: TypeIDFromUint32(1, binary.LittleEndian),
+					Impl: &NodeRight{
+						Owner:    uint64(i),
+						Padding:  [2]byte{0x00, 0x00},
+						Quantity: Uint64(i * 100),
+					},
+				},
+			}
+		case 2:
+			nodes[i] = &Node{
+				BaseVariant: BaseVariant{
+					TypeID: TypeIDFromUint32(2, binary.LittleEndian),
+					Impl: &NodeInner{
+						Key: Uint128{
+							Lo: uint64(i * 1000000),
+							Hi: 0,
+						},
+					},
+				},
+			}
+		}
+	}
+
+	return &Forest{
+		T: Tree{
+			Padding:   [5]byte{0x73, 0x65, 0x72, 0x75, 0x6d},
+			NodeCount: uint32(numNodes),
+			Random:    65535,
+			Nodes:     nodes,
+		},
+	}
+}
+
+// Benchmarks for encoding
+func BenchmarkEncode(b *testing.B) {
+	sizes := []int{1, 10, 100, 1000}
+
+	for _, size := range sizes {
+		b.Run("Forest/Nodes="+string(rune(size)), func(b *testing.B) {
+			forest := createSampleForest(size)
+			b.ResetTimer()
+
+			for i := 0; i < b.N; i++ {
+				buf := new(bytes.Buffer)
+				enc := NewBinEncoder(buf)
+				err := enc.Encode(forest)
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+// Benchmarks for decoding
+func BenchmarkDecode(b *testing.B) {
+	sizes := []int{1, 10, 100, 1000}
+
+	for _, size := range sizes {
+		// First create the encoded data
+		forest := createSampleForest(size)
+		buf := new(bytes.Buffer)
+		enc := NewBinEncoder(buf)
+		err := enc.Encode(forest)
+		if err != nil {
+			b.Fatal(err)
+		}
+		encodedData := buf.Bytes()
+
+		b.Run("Forest/Nodes="+string(rune(size)), func(b *testing.B) {
+			b.ResetTimer()
+
+			for i := 0; i < b.N; i++ {
+				decoder := NewBinDecoder(encodedData)
+				result := &Forest{}
+				err := decoder.Decode(result)
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+// Benchmark individual variant operations
+func BenchmarkVariantOperations(b *testing.B) {
+	// Test type ID creation
+	b.Run("TypeIDFromUint32", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			_ = TypeIDFromUint32(uint32(i), binary.LittleEndian)
+		}
+	})
+
+	b.Run("TypeIDFromUvarint32", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			_ = TypeIDFromUvarint32(uint32(i))
+		}
+	})
+
+	// Test variant definition creation
+	b.Run("NewVariantDefinition", func(b *testing.B) {
+		types := []VariantType{
+			{"left_node", (*NodeLeft)(nil)},
+			{"right_node", (*NodeRight)(nil)},
+			{"inner_node", (*NodeInner)(nil)},
+		}
+
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			_ = NewVariantDefinition(Uint32TypeIDEncoding, types)
+		}
+	})
+}
+
+// Benchmark variant marshaling/unmarshaling with different node types
+func BenchmarkVariantNodes(b *testing.B) {
+	// Test left node
+	b.Run("LeftNode/Marshal", func(b *testing.B) {
+		node := &Node{
+			BaseVariant: BaseVariant{
+				TypeID: TypeIDFromUint32(0, binary.LittleEndian),
+				Impl: &NodeLeft{
+					Key:         42,
+					Description: "test",
+				},
+			},
+		}
+
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			buf := new(bytes.Buffer)
+			enc := NewBinEncoder(buf)
+			err := node.MarshalWithEncoder(enc)
+			if err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+
+	// Create encoded left node for unmarshal testing
+	leftNode := &Node{
+		BaseVariant: BaseVariant{
+			TypeID: TypeIDFromUint32(0, binary.LittleEndian),
+			Impl: &NodeLeft{
+				Key:         42,
+				Description: "test",
+			},
+		},
+	}
+	buf := new(bytes.Buffer)
+	enc := NewBinEncoder(buf)
+	err := leftNode.MarshalWithEncoder(enc)
+	if err != nil {
+		b.Fatal(err)
+	}
+	encodedLeftNode := buf.Bytes()
+
+	b.Run("LeftNode/Unmarshal", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			decoder := NewBinDecoder(encodedLeftNode)
+			node := &Node{}
+			err := node.UnmarshalWithDecoder(decoder)
+			if err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
+
+// Benchmark concurrent access patterns
+func BenchmarkConcurrentVariant(b *testing.B) {
+	b.Run("Parallel/Encode", func(b *testing.B) {
+		forest := createSampleForest(100)
+		b.ResetTimer()
+
+		b.RunParallel(func(pb *testing.PB) {
+			for pb.Next() {
+				buf := new(bytes.Buffer)
+				enc := NewBinEncoder(buf)
+				err := enc.Encode(forest)
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	})
+
+	// Create encoded data for parallel decode testing
+	forest := createSampleForest(100)
+	buf := new(bytes.Buffer)
+	enc := NewBinEncoder(buf)
+	err := enc.Encode(forest)
+	if err != nil {
+		b.Fatal(err)
+	}
+	encodedData := buf.Bytes()
+
+	b.Run("Parallel/Decode", func(b *testing.B) {
+		b.ResetTimer()
+
+		b.RunParallel(func(pb *testing.PB) {
+			for pb.Next() {
+				decoder := NewBinDecoder(encodedData)
+				result := &Forest{}
+				err := decoder.Decode(result)
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	})
+}
